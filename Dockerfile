@@ -10,30 +10,44 @@ WORKDIR /usr/src/app
 RUN apt-get update \
     && apt-get install -y \
     # Dependencies for Chromium
+    gconf-service \
+    libasound2 \        # <--- THIS PROVIDES libasound.so.2
     libatk1.0-0 \
     libatk-bridge2.0-0 \
+    libc6 \
+    libcairo2 \
     libcups2 \
     libdbus-1-3 \
-    libdrm2 \
-    libgbm1 \
+    libexpat1 \
+    libfontconfig1 \
+    libgcc1 \
+    libgconf-2-4 \
+    libgdk-pixbuf2.0-0 \
+    libglib2.0-0 \
     libgtk-3-0 \
     libnspr4 \
-    libnss3 \
     libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    libstdc++6 \
     libx11-6 \
     libx11-xcb1 \
     libxcb1 \
     libxcomposite1 \
+    libxcursor1 \
     libxdamage1 \
     libxext6 \
     libxfixes3 \
+    libxi6 \
     libxrandr2 \
+    libxrender1 \
+    libxss1 \
     libxtst6 \
     ca-certificates \
     fonts-liberation \
+    libappindicator1 \
+    libnss3 \
     lsb-release \
     xdg-utils \
-    # wget is not strictly needed by puppeteer's bundled chrome but useful for diagnostics
     wget \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
@@ -41,23 +55,15 @@ RUN apt-get update \
 # Copy package.json and package-lock.json (or yarn.lock if you use yarn)
 COPY package*.json ./
 
-# IMPORTANT: For this Docker setup, remove certain Puppeteer-related
-# environment variables from your Render service settings if they are set:
-# - PUPPETEER_EXECUTABLE_PATH (let Puppeteer find its bundled version within node_modules)
-# - PUPPETEER_CACHE_DIR (not needed as it will use node_modules/.local-chromium)
-# - Ensure PUPPETEER_SKIP_CHROMIUM_DOWNLOAD is NOT 'true'
+# Ensure Puppeteer downloads its browser and doesn't use a system one for this setup
+# Remove PUPPETEER_EXECUTABLE_PATH from Render ENV VARS
+# Ensure PUPPETEER_SKIP_CHROMIUM_DOWNLOAD is NOT true in Render ENV VARS
 
-# Install project dependencies. This will trigger Puppeteer's Chromium download
-# into node_modules/puppeteer/.local-chromium/ within this Docker image.
 RUN npm install --production
 
 # Copy the rest of your application code
 COPY . .
 
-# Expose the port your app runs on (Render will set PORT env var)
-# Your server.js uses process.env.PORT || 3000, so this is just informational.
 EXPOSE 3000
 
-# Command to run your application
-# Your server.js should already include --no-sandbox in puppeteer.launch() args
 CMD [ "node", "server.js" ]
