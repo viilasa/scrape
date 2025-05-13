@@ -44,7 +44,7 @@ async function scrapeArticle(googleNewsUrl) {
             console.log('Waiting for potential client-side redirect to the final article page...');
             await page.waitForNavigation({
                 waitUntil: 'networkidle2',
-                timeout: 30000
+                timeout: 60000
             });
             console.log('Client-side redirect to final article page complete.');
         } catch (e) {
