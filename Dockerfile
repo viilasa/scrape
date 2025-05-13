@@ -6,26 +6,29 @@ FROM node:18-slim
 WORKDIR /usr/src/app
 
 # Install system dependencies required by Puppeteer's bundled Chromium
-# These are for Debian-based systems like node:18-slim
+# This list is fairly comprehensive for headless Chrome on Debian-based systems.
 RUN apt-get update \
     && apt-get install -y \
-    # Dependencies for Chromium
+    # Core GUI/graphics libraries often needed even for headless
     gconf-service \
-    libasound2 \       
+    libasound2 \
     libatk1.0-0 \
     libatk-bridge2.0-0 \
     libc6 \
     libcairo2 \
     libcups2 \
     libdbus-1-3 \
+    libdrm2 \
     libexpat1 \
     libfontconfig1 \
+    libgbm1 \       
     libgcc1 \
     libgconf-2-4 \
     libgdk-pixbuf2.0-0 \
     libglib2.0-0 \
     libgtk-3-0 \
     libnspr4 \
+    libnss3 \        
     libpango-1.0-0 \
     libpangocairo-1.0-0 \
     libstdc++6 \
@@ -42,10 +45,10 @@ RUN apt-get update \
     libxrender1 \
     libxss1 \
     libxtst6 \
+    # Other useful packages
     ca-certificates \
     fonts-liberation \
     libappindicator1 \
-    libnss3 \
     lsb-release \
     xdg-utils \
     wget \
@@ -55,15 +58,26 @@ RUN apt-get update \
 # Copy package.json and package-lock.json (or yarn.lock if you use yarn)
 COPY package*.json ./
 
-# Ensure Puppeteer downloads its browser and doesn't use a system one for this setup
-# Remove PUPPETEER_EXECUTABLE_PATH from Render ENV VARS
-# Ensure PUPPETEER_SKIP_CHROMIUM_DOWNLOAD is NOT true in Render ENV VARS
+# IMPORTANT for Docker deployment with this Dockerfile:
+# 1. In Render Environment Variables:
+#    - DELETE/UNSET `PUPPETEER_EXECUTABLE_PATH`
+#    - DELETE/UNSET `PUPPETEER_CACHE_DIR`
+#    - Ensure `PUPPETEER_SKIP_CHROMIUM_DOWNLOAD` is NOT set to `true` (it should be `false` or unset)
+# 2. In package.json, it's best to REMOVE the `postinstall` script that runs `npx puppeteer browsers install chrome`
+#    as Puppeteer's own install script (triggered by `npm install`) will download the correct browser
+#    version into node_modules within this Docker image.
 
+# Install project dependencies. This will trigger Puppeteer's Chromium download
+# into node_modules/puppeteer/.local-chromium/ within this Docker image.
 RUN npm install --production
 
 # Copy the rest of your application code
 COPY . .
 
+# Expose the port your app runs on (Render will set the PORT env var automatically)
+# Your server.js uses process.env.PORT || 3000, so this is mainly informational.
 EXPOSE 3000
 
+# Command to run your application
+# Your server.js already includes necessary launch args like --no-sandbox
 CMD [ "node", "server.js" ]
