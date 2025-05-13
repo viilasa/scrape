@@ -11,7 +11,7 @@ RUN apt-get update \
     && apt-get install -y \
     # Dependencies for Chromium
     gconf-service \
-    libasound2 \        # <--- THIS PROVIDES libasound.so.2
+    libasound2 \       
     libatk1.0-0 \
     libatk-bridge2.0-0 \
     libc6 \
