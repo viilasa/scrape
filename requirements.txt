@@ -1,6 +1,0 @@
-gunicorn
-scrapy
-Flask
-requests
-beautifulsoup4
-readability-lxml
