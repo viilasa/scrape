@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 
 // Concurrency limit for batch scraping. Using the default from your original code.
 // Adjust based on your Render instance resources.
-const MAX_CONCURRENT_SCRAPES = parseInt(process.env.MAX_CONCURRENT_SCRAPES || "2");
+const MAX_CONCURRENT_SCRAPES = parseInt(process.env.MAX_CONCURRENT_SCRAPES || "100");
 
 // Recommended Puppeteer launch arguments from your original code
 const PUPPETEER_LAUNCH_ARGS = [
