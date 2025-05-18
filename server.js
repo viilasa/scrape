@@ -69,7 +69,7 @@ async function scrapeArticle(scrapeUrl, { disableJavaScript = false } = {}) {
         console.log(`[${scrapeUrl}] Navigating (waitUntil: domcontentloaded)...`);
         await page.goto(scrapeUrl, {
             waitUntil: 'domcontentloaded',
-            timeout: 30000 // Original timeout
+            timeout: 60000 // Original timeout
         });
         let currentUrl = page.url();
         console.log(`[${scrapeUrl}] Initial navigation complete. Current URL: ${currentUrl}`);
@@ -78,10 +78,10 @@ async function scrapeArticle(scrapeUrl, { disableJavaScript = false } = {}) {
         // Added check for /rss/articles/ as well
         if (currentUrl.includes('news.google.com/articles/') || currentUrl.includes('news.google.com/rss/articles/')) {
             try {
-                console.log(`[${scrapeUrl}] Google News intermediate page detected. Waiting for redirect (waitUntil: 'load', timeout: 30000ms)...`);
+                console.log(`[${scrapeUrl}] Google News intermediate page detected. Waiting for redirect (waitUntil: 'load', timeout: 60000ms)...`);
                 await page.waitForNavigation({
                     waitUntil: 'load', // MODIFIED: Changed from 'domcontentloaded' for better redirect handling
-                    timeout: 30000    // MODIFIED: Increased timeout from 20000ms (original) to 30000ms
+                    timeout: 60000    // MODIFIED: Increased timeout from 20000ms (original) to 30000ms
                 });
                 currentUrl = page.url(); // Get the URL after navigation has completed
                 console.log(`[${scrapeUrl}] Google News redirect complete. New URL: ${currentUrl}`);
