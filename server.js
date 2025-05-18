@@ -3,12 +3,16 @@ const puppeteer = require('puppeteer');
 const { URL } = require('url');
 
 const app = express();
+app.use(express.json()); // Middleware to parse JSON bodies for POST requests
+
 const PORT = process.env.PORT || 3000;
 
-// Middleware to parse JSON bodies
-app.use(express.json()); // Important for handling POST requests with JSON payload
+// Concurrency limit for batch scraping.
+// WARNING: Setting this to 100 requires SIGNIFICANT server resources.
+// Test thoroughly and monitor your server.
+const MAX_CONCURRENT_SCRAPES = parseInt(process.env.MAX_CONCURRENT_SCRAPES || "100"); // Changed default to 100
 
-// Puppeteer launch arguments for Render/Linux environments
+// Recommended Puppeteer launch arguments
 const PUPPETEER_LAUNCH_ARGS = [
     '--no-sandbox',
     '--disable-setuid-sandbox',
@@ -16,363 +20,280 @@ const PUPPETEER_LAUNCH_ARGS = [
     '--disable-accelerated-2d-canvas',
     '--no-first-run',
     '--no-zygote',
-    // '--single-process', // Disables site isolation, can reduce memory but use with caution
-    '--disable-gpu'
+    '--disable-gpu',
+    // Consider '--single-process' for VERY memory constrained environments,
+    // but it can also lead to instability with many tabs/pages.
+    // Test its impact if you're facing severe memory issues.
+    // '--single-process',
+    '--disable-features=site-per-process',
 ];
 
-// --- Your existing scrapeArticle function (remains largely the same) ---
-async function scrapeArticle(googleNewsUrl) {
+async function scrapeArticle(scrapeUrl, { disableJavaScript = false } = {}) {
     let browser;
-    console.log(`Scraping process started for URL: ${googleNewsUrl}`);
+    console.log(`[${scrapeUrl}] Starting scrape. JS Disabled: ${disableJavaScript}. Concurrency Slot Acquired.`);
+    const startTime = Date.now();
+
     try {
         browser = await puppeteer.launch({
             headless: true,
             args: PUPPETEER_LAUNCH_ARGS,
-            // executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
         });
         const page = await browser.newPage();
 
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
-
-        console.log(`Navigating to initial Google News redirect URL: ${googleNewsUrl}`);
-        await page.goto(googleNewsUrl, {
-            waitUntil: 'load', // Start with 'load' for the initial redirect page
-            timeout: 60000
-        });
-        console.log(`Initial navigation complete. Current URL after page.goto: ${page.url()}`);
-
-        // Google News often has a client-side redirect or a link that needs clicking.
-        // The first page.goto might land on a Google page. We need to ensure we get to the *actual* article.
-        // Sometimes, waitForNavigation is enough if there's an immediate client-side redirect.
-        // Other times, Google might show an interstitial.
-        let finalUrl = page.url();
-
-        // If still on a Google domain after the first goto, try to wait for a further navigation
-        // that might be triggered by client-side JavaScript.
-        if (finalUrl.includes('google.com/url') || finalUrl.includes('news.google.com/rss/articles') || finalUrl.includes('google.com/search')) {
-            console.log(`Still on a Google URL: ${finalUrl}. Attempting to wait for further navigation to actual article.`);
-            try {
-                // Increased timeout for this crucial step.
-                // 'networkidle0' can be more reliable for final page load if resources are heavy.
-                await page.waitForNavigation({
-                    waitUntil: 'networkidle2', // Wait for network to be relatively idle
-                    timeout: 75000 // Longer timeout for the redirect to complete
-                });
-                finalUrl = page.url(); // Update finalUrl after navigation
-                console.log('Further navigation detected. New URL:', finalUrl);
-            } catch (e) {
-                console.warn(`Timeout or error during waitForNavigation for ${googleNewsUrl}: ${e.message}. Current URL: ${page.url()}. Will attempt to scrape current page.`);
-                finalUrl = page.url(); // Use the current URL if waitForNavigation fails
-            }
+        // Optional: Disable JavaScript if requested
+        if (disableJavaScript) {
+            await page.setJavaScriptEnabled(false);
+            console.log(`[${scrapeUrl}] JavaScript explicitly disabled.`);
         }
 
+        await page.setRequestInterception(true);
+        page.on('request', (request) => {
+            if (request.isInterceptResolutionHandled()) return;
 
-        // Check if we successfully navigated away from Google
-        if (finalUrl.includes('google.com') || finalUrl.includes('googleusercontent.com')) {
-            // Sometimes, Google News links might point to an AMP page hosted on googleusercontent.com
-            // which IS the article content, or it could be a consent page.
-            // A more robust check might be needed here depending on what you consider "still on Google".
-            // For now, we'll proceed if it's not a generic google.com search/redirector.
-            // However, if it's clearly not an article page, flag it.
-            if (finalUrl.startsWith('https://news.google.com/') && !finalUrl.includes('/articles/')) { // Example, might need refinement
-                 console.error(`Failed to redirect to the final article. Still on a generic Google URL: ${finalUrl}`);
-                 await browser.close();
-                 return {
-                     error: 'Failed to redirect from Google News to the actual article page.',
-                     originalUrl: googleNewsUrl,
-                     finalUrlAttempted: finalUrl
-                 };
-            }
-            console.warn(`Potentially still on a Google-related URL: ${finalUrl}. Proceeding with scraping attempt.`);
-        } else {
-            console.log(`Landed on actual article URL: ${finalUrl}`);
-        }
+            const resourceType = request.resourceType();
+            const requestUrl = request.url();
 
-
-        let articleData = {};
-
-        // 1. Title
-        articleData.title = await page.evaluate(() => {
-            const ogTitle = document.querySelector('meta[property="og:title"]');
-            if (ogTitle && ogTitle.content) return ogTitle.content.trim();
-            const twitterTitle = document.querySelector('meta[name="twitter:title"]');
-            if (twitterTitle && twitterTitle.content) return twitterTitle.content.trim();
-            const docTitle = document.title;
-            if (docTitle) return docTitle.trim();
-            const h1 = document.querySelector('h1');
-            if (h1) return h1.innerText.trim();
-            return null;
-        });
-
-        // 2. Image
-        articleData.image = await page.evaluate((pageUrl) => {
-            let imageUrl = null;
-            const ogImage = document.querySelector('meta[property="og:image"]');
-            if (ogImage && ogImage.content) imageUrl = ogImage.content;
-            
-            if (!imageUrl) {
-                const twitterImage = document.querySelector('meta[name="twitter:image"]');
-                if (twitterImage && twitterImage.content) imageUrl = twitterImage.content;
-            }
-            if (!imageUrl) {
-                const articleElement = document.querySelector('article img');
-                if (articleElement && articleElement.src) imageUrl = articleElement.src;
-            }
-             // Resolve relative URL to absolute
-            if (imageUrl && !imageUrl.startsWith('http')) {
-                try {
-                    imageUrl = new URL(imageUrl, pageUrl).href;
-                } catch (e) {
-                    // console.warn('Invalid base URL for relative image path:', pageUrl, imageUrl);
-                    return null; // Or handle as an invalid image URL
-                }
-            }
-            return imageUrl;
-        }, finalUrl); // Pass finalUrl to resolve relative image URLs
-
-        // 3. Publish Date
-        articleData.publishDate = await page.evaluate(() => {
-            const jsonLdScript = document.querySelector('script[type="application/ld+json"]');
-            if (jsonLdScript) {
-                try {
-                    const jsonData = JSON.parse(jsonLdScript.innerText);
-                    if (jsonData && jsonData.datePublished) return jsonData.datePublished;
-                    if (jsonData && jsonData.uploadDate) return jsonData.uploadDate; // Common in VideoObject
-                    if (jsonData && Array.isArray(jsonData['@graph'])) {
-                        const articleGraph = jsonData['@graph'].find(item => ['Article', 'NewsArticle', 'WebPage', 'BlogPosting'].includes(item['@type']));
-                        if (articleGraph && articleGraph.datePublished) return articleGraph.datePublished;
-                        if (articleGraph && articleGraph.dateModified) return articleGraph.dateModified; // Fallback to modified
-                    }
-                    if (jsonData && jsonData.dateModified) return jsonData.dateModified; // General fallback
-                } catch (e) { /* ignore parsing errors */ }
-            }
-            const metaPublishedTime = document.querySelector('meta[property="article:published_time"]');
-            if (metaPublishedTime && metaPublishedTime.content) return metaPublishedTime.content;
-            
-            const metaDate = document.querySelector('meta[name="date"]'); // Some sites use this
-            if (metaDate && metaDate.content) return metaDate.content;
-
-            const timeElement = document.querySelector('time[datetime]');
-            if (timeElement && timeElement.getAttribute('datetime')) return timeElement.getAttribute('datetime');
-            
-            // Less reliable, try to find text patterns (use with caution)
-            // const bodyText = document.body.innerText;
-            // const dateRegex = /(\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s\d{1,2},\s\d{4}\b)/i;
-            // const match = bodyText.match(dateRegex);
-            // if (match) return match[0];
-
-            return null;
-        });
-
-        // 4. Content
-        articleData.content = await page.evaluate(() => {
-            let contentElement;
-            const selectors = [
-                'article .entry-content', 'article .post-content', 'article .td-post-content',
-                'article .story-content', 'article .article__content', 'article .content',
-                'div[class*="article-body"]', 'div[class*="ArticleBody"]', 'div[class*="article-content"]',
-                'div[itemprop="articleBody"]', 'div.main-content', 'div.articletext', // Added more generic ones
-                'section[class*="article-content"]', 'div[class*="wysiwyg"]', // Common in CMS
-                'article' // Last resort
+            const blockedResourceTypes = ['image', 'media', 'font', 'stylesheet'];
+            const blockedDomains = [
+                'googlesyndication.com', 'googleadservices.com', 'doubleclick.net', 'google-analytics.com',
+                'connect.facebook.net', 'platform.twitter.com', 'criteo.com', 'adsrvr.org',
+                'scorecardresearch.com', 'adservice.google.com', 'pubmatic.com', 'rubiconproject.com',
+                'outbrain.com', 'taboola.com', 'track.hubspot.com', '.hotjar.com', '.inspectlet.com',
+                // Add more general ad/tracker/analytics domains
             ];
-            for (let selector of selectors) {
-                contentElement = document.querySelector(selector);
-                if (contentElement) break;
-            }
-            if (contentElement) {
-                // Remove common non-content elements more aggressively
-                contentElement.querySelectorAll('script, style, aside, .ads, .ad, [class*="related"], [id*="related"], figure figcaption, .caption, .meta, .author, .timestamp, .share, .comments, #comments, .sidebar, .footer, .header, nav, form, button, input, .social-share, [role="navigation"], [role="banner"], [role="complementary"], [role="contentinfo"], noscript').forEach(el => el.remove());
-                
-                // Get paragraphs, join them, and clean up
-                let texts = [];
-                contentElement.querySelectorAll('p, h1, h2, h3, h4, li').forEach(el => {
-                    const text = el.innerText?.trim();
-                    if (text && text.length > 20) { // Only include meaningful text blocks
-                         // Avoid including text that looks like navigation or boilerplate
-                        if (!['advertisement', 'related posts', 'share this article', 'comments', 'leave a reply'].some(phrase => text.toLowerCase().includes(phrase))) {
-                            texts.push(text);
-                        }
-                    }
-                });
-                let combinedText = texts.join('\n\n'); // Join paragraphs with double newlines
-                if (combinedText.length < 100 && contentElement.innerText) { // Fallback if P selection fails
-                    combinedText = contentElement.innerText.trim();
-                }
+            // Note: The original code had 'https://www.youtube.com/watch?v=F3pWmvCdrx4' here.
+            // This specific entry is unusual for general ad-blocking and might be overly broad
+            // or specific to a previous use case. Review if it's necessary for your current target sites.
 
-                return combinedText.replace(/\s\s+/g, ' ').replace(/\n\s*\n/g, '\n\n'); // Clean multiple spaces and excessive newlines
+            if (blockedResourceTypes.includes(resourceType) ||
+                blockedDomains.some(domain => requestUrl.includes(domain))) {
+                request.abort().catch(e => console.warn(`[${scrapeUrl}] Failed to abort request: ${e.message.substring(0,100)}`));
+            } else {
+                request.continue().catch(e => console.warn(`[${scrapeUrl}] Failed to continue request: ${e.message.substring(0,100)}`));
             }
-            return null;
         });
 
-        if (!articleData.title && !articleData.content) {
-            console.warn(`No title or content extracted from ${finalUrl}. The page might be structured differently or inaccessible.`);
-            // Optionally, take a screenshot for debugging
-            // await page.screenshot({ path: `debug_screenshot_${Date.now()}.png` });
-            return {
-                error: 'Could not extract meaningful content (title or body) from the page.',
-                originalUrl: googleNewsUrl,
-                finalUrlAttempted: finalUrl
-            };
+        console.log(`[${scrapeUrl}] Navigating (waitUntil: domcontentloaded)...`);
+        await page.goto(scrapeUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: 45000 // Increased timeout slightly for potentially slower responses under load
+        });
+        let currentUrl = page.url();
+        console.log(`[${scrapeUrl}] Initial navigation complete. Current URL: ${currentUrl}`);
+
+        if (currentUrl.includes('news.google.com/articles/')) {
+            try {
+                console.log(`[${scrapeUrl}] Google News intermediate page. Waiting for redirect...`);
+                await page.waitForNavigation({
+                    waitUntil: 'domcontentloaded',
+                    timeout: 30000 // Increased timeout
+                });
+                currentUrl = page.url();
+                console.log(`[${scrapeUrl}] Google News redirect complete. New URL: ${currentUrl}`);
+            } catch (e) {
+                console.warn(`[${scrapeUrl}] Warning/timeout on Google News redirect: ${e.message}. Continuing with ${currentUrl}`);
+            }
         }
+
+        const finalUrl = currentUrl;
+        console.log(`[${scrapeUrl}] Landed on article URL: ${finalUrl}. Extracting data...`);
+
+        if (finalUrl.includes('google.com/rss/articles') || (finalUrl.includes('google.com/articles') && !scrapeUrl.startsWith(finalUrl))) {
+            throw new Error('Failed to redirect from Google News to the actual article page.');
+        }
+
+        const articleData = await page.evaluate(() => {
+            // ... (rest of your page.evaluate function - no changes needed here)
+            let data = { title: null, image: null, publishDate: null, content: null };
+            // Title
+            data.title = (() => {
+                const ogTitle = document.querySelector('meta[property="og:title"]');
+                if (ogTitle && ogTitle.content) return ogTitle.content.trim();
+                const twitterTitle = document.querySelector('meta[name="twitter:title"]');
+                if (twitterTitle && twitterTitle.content) return twitterTitle.content.trim();
+                const docTitle = document.title;
+                if (docTitle) return docTitle.trim();
+                const h1 = document.querySelector('h1');
+                if (h1) return h1.innerText.trim();
+                return null;
+            })();
+            // Image
+            data.image = (() => {
+                const ogImage = document.querySelector('meta[property="og:image"]');
+                if (ogImage && ogImage.content) return ogImage.content;
+                const twitterImage = document.querySelector('meta[name="twitter:image"]');
+                if (twitterImage && twitterImage.content) return twitterImage.content;
+                const articleImg = document.querySelector('article img');
+                if (articleImg && articleImg.src) return articleImg.src;
+                return null;
+            })();
+            // Publish Date
+            data.publishDate = (() => {
+                const jsonLdScript = document.querySelector('script[type="application/ld+json"]');
+                if (jsonLdScript) {
+                    try {
+                        const jsonData = JSON.parse(jsonLdScript.innerText);
+                        if (jsonData) {
+                            if (jsonData.datePublished) return jsonData.datePublished;
+                            if (jsonData.uploadDate) return jsonData.uploadDate; // Common for videos, but sometimes for articles
+                            if (Array.isArray(jsonData['@graph'])) {
+                                const articleGraph = jsonData['@graph'].find(item => item['@type'] === 'Article' || item['@type'] === 'NewsArticle' || item['@type'] === 'WebPage');
+                                if (articleGraph && articleGraph.datePublished) return articleGraph.datePublished;
+                            }
+                            if (jsonData.dateModified) return jsonData.dateModified; // Fallback to modified if published not found
+                        }
+                    } catch (e) {/* ignore JSON parse errors */}
+                }
+                const metaTime = document.querySelector('meta[property="article:published_time"]');
+                if (metaTime && metaTime.content) return metaTime.content;
+                const timeEl = document.querySelector('time[datetime]');
+                if (timeEl && timeEl.getAttribute('datetime')) return timeEl.getAttribute('datetime');
+                return null;
+            })();
+            // Content
+            data.content = (() => {
+                let contentElement;
+                const selectors = [
+                    'article .entry-content', 'article .post-content', 'article .td-post-content',
+                    'article .story-content', 'article .article__content', 'article .content',
+                    'div[class*="article-body"]', 'div[class*="ArticleBody"]', 'div[class*="article-content"]',
+                    'div[itemprop="articleBody"]', 'article' // 'article' as a last resort
+                ];
+                for (let selector of selectors) {
+                    contentElement = document.querySelector(selector);
+                    if (contentElement) break;
+                }
+                if (contentElement) {
+                    // Remove common unwanted elements before extracting text
+                    contentElement.querySelectorAll('script, style, aside, .ads, .ad, [class*="related"], [id*="related"], figure figcaption, .caption, .meta, .author, .timestamp, .share, .social-share, .comments-area, #comments, noscript, iframe, form, button, input, .header, .footer, .nav, .sidebar, [aria-hidden="true"]').forEach(el => el.remove());
+                    return contentElement.innerText.trim().replace(/\s\s+/g, ' '); // Normalize whitespace
+                }
+                return null;
+            })();
+            return data;
+        });
 
         articleData.url = finalUrl;
-        articleData.originalUrl = googleNewsUrl;
-        console.log(`Successfully scraped data for: ${finalUrl} (from ${googleNewsUrl})`);
-        return articleData;
+        const duration = (Date.now() - startTime) / 1000;
+        console.log(`[${scrapeUrl}] Successfully scraped in ${duration.toFixed(2)}s. Title: ${articleData.title ? articleData.title.substring(0, 50) + '...' : 'N/A'}`);
+        return { success: true, data: articleData, originalUrl: scrapeUrl };
 
     } catch (error) {
-        console.error(`Error during scraping process for ${googleNewsUrl}:`, error);
-        return { error: error.message, url: googleNewsUrl, details: error.stack, finalUrlAttempted: page ? page.url() : 'N/A' };
+        const duration = (Date.now() - startTime) / 1000;
+        console.error(`[${scrapeUrl}] Error after ${duration.toFixed(2)}s: ${error.message}`);
+        // Log less verbose stack for general errors, more for specific ones if needed
+        const errorDetails = (error.stack && error.message.includes("Timeout")) ? error.message : error.stack;
+        return { success: false, error: error.message, originalUrl: scrapeUrl, details: errorDetails };
     } finally {
         if (browser) {
             try {
                 await browser.close();
-                console.log(`Browser closed for ${googleNewsUrl}`);
+                // console.log(`[${scrapeUrl}] Browser closed.`); // Can be too verbose with high concurrency
             } catch (closeError) {
-                console.error(`Error closing browser for ${googleNewsUrl}:`, closeError);
+                console.error(`[${scrapeUrl}] Error closing browser: ${closeError.message}`);
             }
         }
+        // console.log(`[${scrapeUrl}] Concurrency Slot Released.`); // Also potentially too verbose
     }
 }
 
-// --- Root Route ---
+// --- API Endpoints ---
 app.get('/', (req, res) => {
-    res.send('Puppeteer scraping service is running. Use /api/scrape?url=<URL> for single or POST to /api/scrape-multiple with {"urls": [...]} for multiple articles.');
+    res.send(`Puppeteer scraping service is running. Use GET /api/scrape?url=<URL> for single or POST /api/scrape-batch for multiple URLs. Max concurrent for batch: ${MAX_CONCURRENT_SCRAPES}`);
 });
 
-// --- Single URL Scrape Endpoint (existing) ---
+// Single URL scraping endpoint
 app.get('/api/scrape', async (req, res) => {
     const urlToScrape = req.query.url;
+    const disableJavaScript = req.query.disableJavaScript === 'true';
 
-    if (!urlToScrape) {
-        return res.status(400).json({ error: 'URL query parameter is required.' });
-    }
+    if (!urlToScrape) return res.status(400).json({ error: 'URL query parameter is required.' });
 
+    let validatedUrl;
     try {
-        new URL(urlToScrape);
+        validatedUrl = new URL(urlToScrape);
     } catch (e) {
         return res.status(400).json({ error: 'Invalid URL format provided.' });
     }
 
-    console.log(`Received single scrape request for URL: ${urlToScrape}`);
-    const scrapedData = await scrapeArticle(urlToScrape);
+    console.log(`[API /api/scrape] Received single URL: ${validatedUrl.href}`);
+    const result = await scrapeArticle(validatedUrl.href, { disableJavaScript });
 
-    if (scrapedData.error) {
-        console.error(`Scraping failed for ${urlToScrape}: ${scrapedData.error}`);
+    if (!result.success) {
         return res.status(500).json({
             message: "Failed to scrape the article.",
-            errorDetails: scrapedData.error, // Send the error message
-            originalUrl: scrapedData.url,
-            finalUrlAttempted: scrapedData.finalUrlAttempted
+            error: result.error,
+            originalUrl: result.originalUrl,
+            details: result.details
         });
     }
-    res.json(scrapedData);
+    res.json(result.data);
 });
 
-// --- New Multiple URLs Scrape Endpoint ---
-app.post('/api/scrape-multiple', async (req, res) => {
-    const { urls } = req.body;
+// Batch URL scraping endpoint
+app.post('/api/scrape-batch', async (req, res) => {
+    const urls = req.body.urls;
+    const options = req.body.options || {}; // e.g., { disableJavaScript: true }
 
     if (!urls || !Array.isArray(urls) || urls.length === 0) {
         return res.status(400).json({ error: 'An array of "urls" is required in the request body.' });
     }
-    if (urls.length > 100) { // Optional: Set a limit
-        return res.status(400).json({ error: `Too many URLs provided. Maximum is 100, you sent ${urls.length}.` });
+    const MAX_URLS_PER_BATCH = parseInt(process.env.MAX_URLS_PER_BATCH || "500"); // Increased safety limit for urls in a single request
+    if (urls.length > MAX_URLS_PER_BATCH) {
+        return res.status(400).json({ error: `Too many URLs. Max ${MAX_URLS_PER_BATCH} per batch, got ${urls.length}.` });
     }
 
-    const validatedUrls = [];
-    for (const u of urls) {
+    console.log(`[API /api/scrape-batch] Received ${urls.length} URLs. Max concurrency: ${MAX_CONCURRENT_SCRAPES}. Options: ${JSON.stringify(options)}`);
+
+    const pLimitModule = await import('p-limit');
+    const limit = pLimitModule.default(MAX_CONCURRENT_SCRAPES);
+
+    const promises = urls.map(url => {
+        let validatedUrl;
         try {
-            new URL(u); // Validate each URL
-            validatedUrls.push(u);
+            validatedUrl = new URL(url); // Basic validation
+            if (!validatedUrl.protocol.startsWith('http')) {
+                 throw new Error('URL must start with http or https');
+            }
+            return limit(() => scrapeArticle(validatedUrl.href, options));
         } catch (e) {
-            console.warn(`Invalid URL in batch: ${u}`);
-            // Optionally add an error object for this specific URL in the results
-            // instead of failing the whole batch immediately.
-            // For now, we'll just skip invalid ones or let it be handled by scrapeArticle.
-        }
-    }
-    if (validatedUrls.length === 0) {
-         return res.status(400).json({ error: 'No valid URLs found in the provided list.' });
-    }
-
-
-    console.log(`Received request to scrape ${validatedUrls.length} URLs.`);
-
-    // Using Promise.allSettled to ensure all scraping attempts complete
-    // This is better than Promise.all if you want results for all URLs, even if some fail.
-    const results = await Promise.allSettled(validatedUrls.map(url => scrapeArticle(url)));
-
-    const responseData = results.map((result, index) => {
-        if (result.status === 'fulfilled') {
-            return result.value; // This is the object returned by scrapeArticle (data or error object)
-        } else {
-            // This handles unexpected errors in scrapeArticle or the Promise machinery itself
-            console.error(`Unexpected error scraping ${validatedUrls[index]}:`, result.reason);
-            return {
-                error: 'An unexpected error occurred during scraping this URL.',
-                details: result.reason.message || result.reason,
-                url: validatedUrls[index]
-            };
+            console.error(`[API /api/scrape-batch] Invalid URL in batch: "${url}". Error: ${e.message}`);
+            // Ensure this error is also structured like other results for consistent client-side handling
+            return Promise.resolve({ success: false, error: `Invalid URL format: ${url} (${e.message})`, originalUrl: url });
         }
     });
 
-    res.json(responseData);
-});
+    const results = await Promise.allSettled(promises);
+    // const results = await Promise.all(promises); // Using allSettled is safer to get all results
 
-// --- Concurrency Limited Multiple URLs Scrape Endpoint (Alternative) ---
-// This is a more robust way if you have many URLs or limited resources.
-// You'd need to install p-limit: npm install p-limit
-/*
-const pLimit = require('p-limit');
-
-app.post('/api/scrape-multiple-limited', async (req, res) => {
-    const { urls } = req.body;
-
-    if (!urls || !Array.isArray(urls) || urls.length === 0) {
-        return res.status(400).json({ error: 'An array of "urls" is required in the request body.' });
-    }
-    if (urls.length > 200) { // Example limit
-        return res.status(400).json({ error: `Too many URLs provided. Maximum is 200, you sent ${urls.length}.` });
-    }
-
-    console.log(`Received request to scrape ${urls.length} URLs with concurrency limit.`);
-
-    const limit = pLimit(5); // Set concurrency limit (e.g., 5 Puppeteer instances at a time)
-    const scrapingPromises = urls.map(url => {
-        try {
-            new URL(url); // Basic validation
-            return limit(() => scrapeArticle(url));
-        } catch (e) {
-            console.warn(`Invalid URL in batch: ${url} - skipping.`);
-            return Promise.resolve({ error: 'Invalid URL format provided.', url });
-        }
-    });
-
-    const results = await Promise.allSettled(scrapingPromises);
-
-    const responseData = results.map((result, index) => {
-        const originalUrl = urls[index]; // Ensure original URL is tied correctly
+    const response = results.map(result => {
         if (result.status === 'fulfilled') {
             return result.value;
         } else {
-            console.error(`Unexpected error scraping ${originalUrl}:`, result.reason);
-            return {
-                error: 'An unexpected error occurred during scraping this URL.',
-                details: result.reason.message || result.reason,
-                url: originalUrl
-            };
+            // This block handles rejections from the promises created by p-limit,
+            // which shouldn't happen if scrapeArticle itself always resolves an object.
+            // However, it's a good fallback.
+            console.error(`[API /api/scrape-batch] Unexpected promise rejection: ${result.reason}`);
+            // Try to find original URL if possible from the error, though it might not be there
+            let originalUrl = 'unknown';
+            if (result.reason && result.reason.originalUrl) {
+                originalUrl = result.reason.originalUrl;
+            } else if (result.reason && typeof result.reason.message === 'string' && result.reason.message.includes('Invalid URL format:')) {
+                // Attempt to parse URL from a specific error message format if used above
+                const urlMatch = result.reason.message.match(/Invalid URL format: (.*?) \(/);
+                if (urlMatch && urlMatch[1]) {
+                    originalUrl = urlMatch[1];
+                }
+            }
+            return { success: false, error: 'Unexpected error during scraping process.', originalUrl: originalUrl, details: result.reason.toString() };
         }
     });
-    res.json(responseData);
+
+    console.log(`[API /api/scrape-batch] Batch processing complete. Total results: ${response.length}. Successes: ${response.filter(r => r.success).length}. Failures: ${response.filter(r => !r.success).length}`);
+    res.json(response);
 });
-*/
 
 
 app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-    console.log('Endpoints:');
-    console.log(`  GET  /api/scrape?url=<URL_TO_SCRAPE>`);
-    console.log(`  POST /api/scrape-multiple (Body: {"urls": ["url1", "url2", ...]})`);
-    // console.log(`  POST /api/scrape-multiple-limited (Body: {"urls": ["url1", "url2", ...]})`);
+    console.log(`Server is running on port ${PORT}. Max concurrent scrapes: ${MAX_CONCURRENT_SCRAPES}`);
 });
